@@ -1,4 +1,4 @@
-name: Sync Repo to OpenAI Storage
+name: Sync Repo to OpenAI Storage (per-file)
 
 on:
   workflow_call:
@@ -18,103 +18,89 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Build snapshot
-        run: |
-          set -euo pipefail
-          REPO=$(basename "$GITHUB_REPOSITORY")
-          OUT="${REPO}.md"
-          {
-            echo "# Repository Snapshot: ${REPO}"
-            echo
-            echo "> Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-            echo
-          } > "$OUT"
-
-          mapfile -t FILES < <(git ls-files | grep -vE '^\.git/' | grep -vE '^\.github/workflows/')
-          for F in "${FILES[@]}"; do
-            if [ -f "$F" ] && [ "$(stat -c%s "$F")" -le 1572864 ]; then
-              EXT="${F##*.}"; case "$EXT" in
-                md) L=markdown;; js) L=javascript;; ts) L=typescript;; json) L=json;;
-                yml|yaml) L=yaml;; py) L=python;; html|htm) L=html;; css) L=css;;
-                sh|bash) L=bash;; *) L="";;
-              esac
-              printf "\n---\n\n## %s\n\n" "$F" >> "$OUT"
-              if [ -n "$L" ]; then echo "\`\`\`$L" >> "$OUT"; else echo "\`\`\`" >> "$OUT"; fi
-              cat "$F" >> "$OUT"
-              echo -e "\n\`\`\`\n" >> "$OUT"
-            else
-              printf "\n---\n\n## %s\n\n\`\`\`text\n[skipped: too large or not a regular file]\n\`\`\`\n" "$F" >> "$OUT"
-            fi
-          done
-
-          echo "SNAPSHOT_FILE=$OUT" >> $GITHUB_ENV
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install OpenAI SDK
-        run: npm i openai@^4
+      - run: npm i openai@^4
 
-      - name: Upload to OpenAI Vector Store
+      - name: Upload files one by one
         run: |
           node --input-type=module - <<'NODE'
           import fs from "fs";
+          import path from "path";
+          import { execSync } from "child_process";
           import OpenAI from "openai";
 
           const apiKey   = process.env.OPENAI_API_KEY;
-          const project  = process.env.OPENAI_PROJECT || undefined;
           const vsId     = process.env.VECTOR_STORE_ID;
-          const snapshot = process.env.SNAPSHOT_FILE;
           const repoName = (process.env.GITHUB_REPOSITORY || "").split("/").pop();
 
           if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
           if (!vsId)   throw new Error("Missing VECTOR_STORE_ID");
-          if (!snapshot || !fs.existsSync(snapshot)) throw new Error("Snapshot missing: " + snapshot);
 
-          const client = new OpenAI({ apiKey, project });
+          const client = new OpenAI({ apiKey });
+
+          // collect repo files
+          const allFiles = execSync("git ls-files", { encoding: "utf-8" })
+            .split("\n")
+            .filter(f =>
+              f &&
+              !f.startsWith(".git/") &&
+              !f.startsWith(".github/workflows/") &&
+              !f.includes("node_modules") &&
+              !/\.(png|jpg|jpeg|gif|svg|ico|lock)$/i.test(f)
+            );
+
+          console.log(`Found ${allFiles.length} candidate files`);
 
           (async () => {
-            // delete existing file with same name
-            const list0 = await client.vectorStores.files.list(vsId);
-            const olds  = list0.data.filter(f => f.filename === `${repoName}.md`);
-            for (const f of olds) {
-              console.log("Deleting existing:", f.id, f.filename);
-              await client.vectorStores.files.del(vsId, f.id);
-            }
-
-            // upload + poll
-            let vf;
-            if (typeof client.vectorStores?.files?.uploadAndPoll === "function") {
-              vf = await client.vectorStores.files.uploadAndPoll(vsId, fs.createReadStream(snapshot));
-            } else {
-              const created = await client.files.create({
-                file: fs.createReadStream(snapshot),
-                purpose: "assistants"
-              });
-              if (typeof client.vectorStores?.files?.createAndPoll !== "function") {
-                throw new Error("OpenAI SDK too old");
+            for (const relPath of allFiles) {
+              const absPath = path.resolve(relPath);
+              if (!fs.existsSync(absPath)) continue;
+              const stat = fs.statSync(absPath);
+              if (!stat.isFile() || stat.size > 2 * 1024 * 1024) {
+                console.log(`Skipping ${relPath} (too large or not a file)`);
+                continue;
               }
-              vf = await client.vectorStores.files.createAndPoll(vsId, { file_id: created.id });
-            }
 
-            console.log("Attach/index status:", vf.status);
-            if (vf.status !== "completed") {
-              console.error("Vectorization did not complete:", JSON.stringify(vf, null, 2));
-              process.exit(1);
-            }
+              const vectorName = `${repoName}/${relPath}`;
+              console.log(`Processing ${vectorName} (${stat.size} bytes)`);
 
-            const list = await client.vectorStores.files.list(vsId);
-            const mine = list.data.find(f => f.id === vf.id) || list.data.find(f => f.filename === `${repoName}.md`);
-            console.log("Vector store now has", list.data.length, "files");
-            console.log("Indexed file:", { id: mine?.id, name: mine?.filename, bytes: mine?.bytes, status: mine?.status });
-          })().catch(err => {
-            const body = err?.response?.data || err?.stack || err?.message || err;
-            console.error("Sync error:", body);
-            process.exit(1);
-          });
+              // delete any old version
+              const list0 = await client.vectorStores.files.list(vsId);
+              const olds  = list0.data.filter(f => f.filename === vectorName);
+              for (const old of olds) {
+                console.log(`Deleting old: ${old.filename}`);
+                await client.vectorStores.files.del(vsId, old.id);
+              }
+
+              try {
+                let vf;
+                if (typeof client.vectorStores?.files?.uploadAndPoll === "function") {
+                  vf = await client.vectorStores.files.uploadAndPoll(
+                    vsId,
+                    fs.createReadStream(absPath),
+                    { filename: vectorName }
+                  );
+                } else {
+                  const created = await client.files.create({
+                    file: fs.createReadStream(absPath),
+                    purpose: "assistants"
+                  });
+                  vf = await client.vectorStores.files.createAndPoll(vsId, {
+                    file_id: created.id
+                  });
+                }
+
+                console.log(`Indexed: ${vf.filename} (status: ${vf.status})`);
+              } catch (err) {
+                const body = err?.response?.data || err?.stack || err?.message || err;
+                console.error(`❌ Failed ${vectorName}:`, body);
+              }
+            }
+          })();
           NODE
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           VECTOR_STORE_ID: ${{ inputs.vector_store_id }}
-          OPENAI_PROJECT: ${{ vars.OPENAI_PROJECT }}
