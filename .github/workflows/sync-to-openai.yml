@@ -1,4 +1,4 @@
-name: Sync Repo to OpenAI Storage (per-file, deduped)
+name: Sync Repo to OpenAI Storage (per-file, robust paths)
 
 on:
   workflow_call:
@@ -17,6 +17,7 @@ concurrency:
 jobs:
   sync-repo:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,20 +50,33 @@ jobs:
 
           const client = new OpenAI({ apiKey });
 
-          const listFiles = () =>
-            execSync("git ls-files", { encoding: "utf8" })
-              .split("\n")
+          // files/dirs to ignore
+          const IGNORE_DIRS = [
+            ".git/",
+            ".github/workflows/",
+            "node_modules/",
+            ".gitbook/assets/"
+          ];
+
+          // binary extensions we won't upload
+          const BIN_EXT = /\.(png|jpg|jpeg|gif|svg|ico|pdf|zip|gz|tgz|bz2|xz|7z|rar|mp3|mp4|mov|avi|mkv|webm|wav|ogg|flac|lock|woff2?|ttf|eot|exe|dll|so|dylib|psd|ai|sketch)$/i;
+
+          // Null-separated listing; safe for spaces/newlines/quotes in names
+          function listFiles() {
+            const raw = execSync("git ls-files -z", { encoding: "buffer" });
+            return raw
+              .toString("utf8")
+              .split("\0")
               .filter(Boolean)
-              .filter(f =>
-                !f.startsWith(".git/") &&
-                !f.startsWith(".github/workflows/") &&
-                !f.includes("node_modules/") &&
-                !/\.(png|jpg|jpeg|gif|svg|ico|pdf|zip|gz|tar|lock|woff2?|ttf|eot)$/i.test(f)
-              );
+              .map((f) => f.replace(/^"(.*)"$/, "$1")) // strip accidental surrounding quotes
+              .filter((f) => !IGNORE_DIRS.some((d) => f.startsWith(d)))
+              .filter((f) => !BIN_EXT.test(f));
+          }
 
-          const sha256 = (p) => crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
+          const sha256 = (p) =>
+            crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
 
-          // paginate over ALL vector-store files, yielding pages
+          // paginate whole vector store
           async function* pages(params = {}) {
             let after;
             do {
@@ -72,7 +86,6 @@ jobs:
             } while (after);
           }
 
-          // return ALL store files whose filename matches exactly
           async function getAllByFilename(name) {
             const matches = [];
             for await (const page of pages()) {
@@ -81,7 +94,6 @@ jobs:
             return matches;
           }
 
-          // delete ALL files by filename (every page)
           async function deleteAllByFilename(name) {
             const all = await getAllByFilename(name);
             for (const f of all) {
@@ -94,7 +106,6 @@ jobs:
             }
           }
 
-          // find an existing file with same filename AND same sha (to skip upload)
           async function hasSameHash(name, sha) {
             for await (const page of pages()) {
               for (const f of page.data) {
@@ -111,33 +122,53 @@ jobs:
 
           (async () => {
             for (const rel of files) {
-              const abs = path.resolve(rel);
-              const st = fs.statSync(abs);
-              if (!st.isFile() || st.size > 2 * 1024 * 1024) {
-                console.log(`Skipping ${rel} (too large or not a file)`);
+              // sanitize any stray quotes again before FS ops
+              const cleanRel = rel.replace(/^"(.*)"$/, "$1");
+              const abs = path.resolve(cleanRel);
+
+              if (!fs.existsSync(abs)) {
+                console.log(`Skipping (missing): ${cleanRel}`);
                 continue;
               }
 
-              const filename = `${repoName}/${rel}`;
+              let st;
+              try {
+                st = fs.statSync(abs);
+              } catch (e) {
+                console.log(`Skipping (stat error): ${cleanRel} -> ${e.message}`);
+                continue;
+              }
+
+              if (!st.isFile()) {
+                console.log(`Skipping (not a file): ${cleanRel}`);
+                continue;
+              }
+              if (st.size > 2 * 1024 * 1024) {
+                console.log(`Skipping (too large >2MB): ${cleanRel}`);
+                continue;
+              }
+              if (BIN_EXT.test(cleanRel)) {
+                console.log(`Skipping (binary ext): ${cleanRel}`);
+                continue;
+              }
+
+              const filename = `${repoName}/${cleanRel}`;
               const hash = sha256(abs);
 
-              // If exact same content already exists, skip
               if (await hasSameHash(filename, hash)) {
                 console.log(`Unchanged, skipping: ${filename}`);
                 continue;
               }
 
-              // Otherwise delete every older copy of that filename (any content)
               await deleteAllByFilename(filename);
 
-              // Upload (pass filename + attributes for future dedupe)
               try {
                 let vf;
                 if (typeof client.vectorStores?.files?.uploadAndPoll === "function") {
                   vf = await client.vectorStores.files.uploadAndPoll(
                     vsId,
                     fs.createReadStream(abs),
-                    { filename, attributes: { repo: repoName, path: rel, sha256: hash } }
+                    { filename, attributes: { repo: repoName, path: cleanRel, sha256: hash } }
                   );
                 } else {
                   const created = await client.files.create({
@@ -145,9 +176,7 @@ jobs:
                     purpose: "assistants",
                     filename
                   });
-                  vf = await client.vectorStores.files.createAndPoll(vsId, {
-                    file_id: created.id
-                  });
+                  vf = await client.vectorStores.files.createAndPoll(vsId, { file_id: created.id });
                 }
 
                 if (vf.status !== "completed") {
