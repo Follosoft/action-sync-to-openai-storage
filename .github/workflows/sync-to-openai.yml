@@ -1,4 +1,4 @@
-name: Sync Repo to OpenAI Storage (per-file)
+name: Sync Repo to OpenAI Storage (per-file, deduped)
 
 on:
   workflow_call:
@@ -9,6 +9,10 @@ on:
     secrets:
       OPENAI_API_KEY:
         required: true
+
+concurrency:
+  group: sync-openai-${{ github.repository }}
+  cancel-in-progress: true
 
 jobs:
   sync-repo:
@@ -24,11 +28,15 @@ jobs:
 
       - run: npm i openai@^4
 
-      - name: Upload files one by one
+      - name: Upload files one by one (dedupe + skip unchanged)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          VECTOR_STORE_ID: ${{ inputs.vector_store_id }}
         run: |
           node --input-type=module - <<'NODE'
           import fs from "fs";
           import path from "path";
+          import crypto from "crypto";
           import { execSync } from "child_process";
           import OpenAI from "openai";
 
@@ -41,66 +49,116 @@ jobs:
 
           const client = new OpenAI({ apiKey });
 
-          // collect repo files
-          const allFiles = execSync("git ls-files", { encoding: "utf-8" })
-            .split("\n")
-            .filter(f =>
-              f &&
-              !f.startsWith(".git/") &&
-              !f.startsWith(".github/workflows/") &&
-              !f.includes("node_modules") &&
-              !/\.(png|jpg|jpeg|gif|svg|ico|lock)$/i.test(f)
-            );
+          const listFiles = () =>
+            execSync("git ls-files", { encoding: "utf8" })
+              .split("\n")
+              .filter(Boolean)
+              .filter(f =>
+                !f.startsWith(".git/") &&
+                !f.startsWith(".github/workflows/") &&
+                !f.includes("node_modules/") &&
+                !/\.(png|jpg|jpeg|gif|svg|ico|pdf|zip|gz|tar|lock|woff2?|ttf|eot)$/i.test(f)
+              );
 
-          console.log(`Found ${allFiles.length} candidate files`);
+          const sha256 = (p) => crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
+
+          // paginate over ALL vector-store files, yielding pages
+          async function* pages(params = {}) {
+            let after;
+            do {
+              const res = await client.vectorStores.files.list(vsId, { after, limit: 100, ...params });
+              yield res;
+              after = res?.last_id;
+            } while (after);
+          }
+
+          // return ALL store files whose filename matches exactly
+          async function getAllByFilename(name) {
+            const matches = [];
+            for await (const page of pages()) {
+              for (const f of page.data) if (f.filename === name) matches.push(f);
+            }
+            return matches;
+          }
+
+          // delete ALL files by filename (every page)
+          async function deleteAllByFilename(name) {
+            const all = await getAllByFilename(name);
+            for (const f of all) {
+              try {
+                await client.vectorStores.files.del(vsId, f.id);
+                console.log("Deleted old copy:", f.id, f.filename);
+              } catch (e) {
+                console.warn("Failed to delete", f.id, e?.response?.data || e?.message || e);
+              }
+            }
+          }
+
+          // find an existing file with same filename AND same sha (to skip upload)
+          async function hasSameHash(name, sha) {
+            for await (const page of pages()) {
+              for (const f of page.data) {
+                if (f.filename === name && f.attributes && f.attributes.sha256 === sha) {
+                  return true;
+                }
+              }
+            }
+            return false;
+          }
+
+          const files = listFiles();
+          console.log(`Found ${files.length} candidate files`);
 
           (async () => {
-            for (const relPath of allFiles) {
-              const absPath = path.resolve(relPath);
-              if (!fs.existsSync(absPath)) continue;
-              const stat = fs.statSync(absPath);
-              if (!stat.isFile() || stat.size > 2 * 1024 * 1024) {
-                console.log(`Skipping ${relPath} (too large or not a file)`);
+            for (const rel of files) {
+              const abs = path.resolve(rel);
+              const st = fs.statSync(abs);
+              if (!st.isFile() || st.size > 2 * 1024 * 1024) {
+                console.log(`Skipping ${rel} (too large or not a file)`);
                 continue;
               }
 
-              const vectorName = `${repoName}/${relPath}`;
-              console.log(`Processing ${vectorName} (${stat.size} bytes)`);
+              const filename = `${repoName}/${rel}`;
+              const hash = sha256(abs);
 
-              // delete any old version
-              const list0 = await client.vectorStores.files.list(vsId);
-              const olds  = list0.data.filter(f => f.filename === vectorName);
-              for (const old of olds) {
-                console.log(`Deleting old: ${old.filename}`);
-                await client.vectorStores.files.del(vsId, old.id);
+              // If exact same content already exists, skip
+              if (await hasSameHash(filename, hash)) {
+                console.log(`Unchanged, skipping: ${filename}`);
+                continue;
               }
 
+              // Otherwise delete every older copy of that filename (any content)
+              await deleteAllByFilename(filename);
+
+              // Upload (pass filename + attributes for future dedupe)
               try {
                 let vf;
                 if (typeof client.vectorStores?.files?.uploadAndPoll === "function") {
                   vf = await client.vectorStores.files.uploadAndPoll(
                     vsId,
-                    fs.createReadStream(absPath),
-                    { filename: vectorName }
+                    fs.createReadStream(abs),
+                    { filename, attributes: { repo: repoName, path: rel, sha256: hash } }
                   );
                 } else {
                   const created = await client.files.create({
-                    file: fs.createReadStream(absPath),
-                    purpose: "assistants"
+                    file: fs.createReadStream(abs),
+                    purpose: "assistants",
+                    filename
                   });
                   vf = await client.vectorStores.files.createAndPoll(vsId, {
                     file_id: created.id
                   });
                 }
 
-                console.log(`Indexed: ${vf.filename} (status: ${vf.status})`);
+                if (vf.status !== "completed") {
+                  console.error("Index failed:", filename, vf?.last_error || vf?.status);
+                } else {
+                  console.log("Indexed:", filename);
+                }
               } catch (err) {
                 const body = err?.response?.data || err?.stack || err?.message || err;
-                console.error(`❌ Failed ${vectorName}:`, body);
+                console.error(`❌ Failed ${filename}:`, body);
               }
             }
           })();
           NODE
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          VECTOR_STORE_ID: ${{ inputs.vector_store_id }}
